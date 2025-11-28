@@ -1,3 +1,4 @@
+
 import streamlit as st
 import os
 import zipfile
@@ -15,13 +16,9 @@ import requests
 
 # --- Costanti per TSL -----------------------------------------------------
 TSL_FILE  = Path("img/TSL-IT.xml")
-TRUST_PEM = Path("tsl-ca.pem")   # nome più descrittivo
+TRUST_PEM = Path("tsl-ca.pem")
 
 def build_trust_store(tsl_path: Path, out_pem: Path):
-    """
-    Estrae tutti i <ds:X509Certificate> dal TSL-IT.xml e li converte
-    in un unico file PEM, con wrapping a 64 caratteri per riga.
-    """
     ns = {
         'tsl': 'http://uri.etsi.org/02231/v2#',
         'ds':  'http://www.w3.org/2000/09/xmldsig#'
@@ -35,15 +32,12 @@ def build_trust_store(tsl_path: Path, out_pem: Path):
         for cert in certs:
             b64 = cert.text.strip() if cert.text else ""
             if len(b64) < 200:
-                # salta eventuali nodi vuoti o troppo corti
                 continue
             f.write(b"-----BEGIN CERTIFICATE-----\n")
-            # spezzetta in blocchi da 64 caratteri
             for i in range(0, len(b64), 64):
                 f.write(b64[i:i+64].encode('ascii') + b"\n")
             f.write(b"-----END CERTIFICATE-----\n\n")
 
-# Costruisco il trust store all’avvio
 try:
     build_trust_store(TSL_FILE, TRUST_PEM)
 except Exception as e:
@@ -59,28 +53,20 @@ with col2:
     logo = Image.open("img/Consip_Logo.png")
     st.image(logo, width=300)
 
+# Lista per firme non valide
+invalid_signatures = []
+
 def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, str, bool]:
-    """
-    Estrae il payload da un .p7m e verifica la firma CAdES contro:
-      - trust store (tsl-ca.pem)
-      - CApath di sistema
-      - fallback AIA + intermedi
-      - accetta self-signed in trust-store
-      - accetta comunque missing issuer
-    Restituisce: (percorso_payload, signer_CN, validità_bool)
-    """
     base       = p7m_path.stem
     payload_out = out_dir / base
     cert_pem    = out_dir / f"{base}_cert.pem"
     chain_pem   = out_dir / f"{base}_chain.pem"
 
-    # 1) estrai il cert del firmatario
     subprocess.run([
         "openssl", "pkcs7", "-inform", "DER", "-in", str(p7m_path),
         "-print_certs", "-out", str(cert_pem)
     ], capture_output=True)
 
-    # 2) primo verify con trust-store + CApath
     cmd1 = ["openssl", "verify", "-CAfile", str(TRUST_PEM)]
     if platform.system() in ("Linux", "Darwin"):
         cmd1 += ["-CApath", "/etc/ssl/certs"]
@@ -89,15 +75,16 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
     stderr1 = p1.stderr.lower()
     chain_ok = (p1.returncode == 0) or ("self signed certificate in certificate chain" in stderr1)
 
-    # 3) fallback AIA + intermedi estratti
+    # Accetta InfoCamere anche se non nel TSL
+    if "infocamere" in stderr1 or "infocamere" in p1.stdout.lower():
+        chain_ok = True
+
     if not chain_ok:
-        # estrai tutti i cert embedded
+        # fallback AIA
         subprocess.run([
             "openssl", "pkcs7", "-inform", "DER", "-in", str(p7m_path),
             "-print_certs", "-out", str(chain_pem)
         ], capture_output=True)
-
-        # scarica eventuali intermedi da AIA
         aia = subprocess.run([
             "openssl", "x509", "-in", str(chain_pem),
             "-noout", "-text"
@@ -113,7 +100,6 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
             except Exception:
                 pass
 
-        # secondo verify: ora includo anche CApath di sistema
         cmd2 = [
             "openssl", "verify", "-CAfile", str(TRUST_PEM),
             "-untrusted", str(chain_pem)
@@ -124,31 +110,17 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
         p2 = subprocess.run(cmd2, capture_output=True, text=True)
         stderr2 = p2.stderr.lower()
         chain_ok = (p2.returncode == 0) or ("self signed certificate in certificate chain" in stderr2)
-
-        # **NUOVO**: se l’unico errore rimasto è “unable to get local issuer certificate”,
-        # lo consideriamo comunque valido
         if not chain_ok and "unable to get local issuer certificate" in stderr2:
             chain_ok = True
 
-    if not chain_ok:
-        st.error(f"Errore verifica catena «{cert_pem.name}»: "
-                 f"{(p2.stderr if 'p2' in locals() else p1.stderr).strip()}")
-        cert_pem.unlink(missing_ok=True)
-        chain_pem.unlink(missing_ok=True)
-        return None, "", False
-
-    # 4) estrai il payload (firma validata)
+    # Estrazione payload anche se non valido
     resc = subprocess.run([
         "openssl", "cms", "-verify", "-in", str(p7m_path),
         "-inform", "DER", "-noverify", "-out", str(payload_out)
     ], capture_output=True)
     if resc.returncode != 0:
-        st.error(f"Errore estrazione «{p7m_path.name}»: {resc.stderr.decode().strip()}")
-        cert_pem.unlink(missing_ok=True)
-        chain_pem.unlink(missing_ok=True)
         return None, "", False
 
-    # 5) leggi signer e validity
     res2 = subprocess.run([
         "openssl", "x509", "-in", str(cert_pem),
         "-noout", "-subject", "-dates"
@@ -156,12 +128,10 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
     cert_pem.unlink(missing_ok=True)
     chain_pem.unlink(missing_ok=True)
     if res2.returncode != 0:
-        st.error(f"Errore lettura info cert: {res2.stderr.strip()}")
         return payload_out, "Sconosciuto", False
 
     lines  = res2.stdout.splitlines()
     subj   = "\n".join(lines)
-    # estrai il primo RDN popolare come signer
     m = re.search(r"(?:CN|SN|UID|emailAddress|SERIALNUMBER)\s*=\s*([^,\/]+)", subj)
     signer = m.group(1).strip() if m else "Sconosciuto"
 
@@ -170,7 +140,13 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
     na  = next(l for l in lines if "notAfter"  in l).split("=",1)[1].strip()
     valid = datetime.strptime(nb, fmt) <= datetime.utcnow() <= datetime.strptime(na, fmt)
 
-    # 6) rinomina in .zip se payload è un archivio
+    if not chain_ok:
+        invalid_signatures.append(f"{payload_out.name} | {signer}")
+        # Aggiungi flag al nome
+        flagged = payload_out.with_name(payload_out.stem + "_NONVALIDO" + payload_out.suffix)
+        payload_out.rename(flagged)
+        payload_out = flagged
+
     try:
         with open(payload_out, "rb") as f:
             if f.read(4) == b"PK\x03\x04":
@@ -180,10 +156,9 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
     except Exception:
         pass
 
-    return payload_out, signer, valid
+    return payload_out, signer, chain_ok
 
-
-# --- ZIP annidati e processing .p7m ---------------------------------------
+# --- Funzioni per ZIP ------------------------------------------------------
 def recursive_unpack_and_flatten(d: Path):
     for z in d.rglob("*.zip"):
         if not z.is_file(): continue
@@ -215,26 +190,16 @@ def process_p7m_dir(d: Path, indent=""):
             tmp = payload.parent
             try:
                 with zipfile.ZipFile(payload) as zf:
-                    inn = [n for n in zf.namelist() if n.lower().endswith(".zip")]
-                    if len(inn) == 1:
-                        data = zf.read(inn[0])
-                        tgt = tmp / Path(inn[0]).name
-                        tgt.write_bytes(data)
-                        with zipfile.ZipFile(tgt) as iz:
-                            iz.extractall(tmp)
-                        payload.unlink(missing_ok=True)
-                    else:
-                        zf.extractall(tmp)
-                        payload.unlink(missing_ok=True)
+                    zf.extractall(tmp)
+                payload.unlink(missing_ok=True)
             except:
-                st.error(f"Errore estrazione ZIP interno di {payload.name}")
                 continue
             recursive_unpack_and_flatten(tmp)
             nested = tmp / payload.stem
             if nested.is_dir():
                 process_p7m_dir(nested, indent + "  ")
 
-# --- Streamlit UI e flusso principale ------------------------------------
+# --- UI principale ---------------------------------------------------------
 output_name = st.text_input("Nome ZIP di output (.zip):", value="all_extracted.zip")
 output_filename = output_name if output_name.lower().endswith(".zip") else output_name + ".zip"
 
@@ -252,17 +217,8 @@ if uploads:
             st.write(f"🔄 ZIP: {name}")
             try:
                 with zipfile.ZipFile(fp) as zf:
-                    inn = [n for n in zf.namelist() if n.lower().endswith(".zip")]
-                    if len(inn) == 1:
-                        data = zf.read(inn[0])
-                        tgt = tmpd / Path(inn[0]).name
-                        tgt.write_bytes(data)
-                        with zipfile.ZipFile(tgt) as iz:
-                            iz.extractall(tmpd)
-                        base_dir = tmpd
-                    else:
-                        zf.extractall(tmpd)
-                        base_dir = tmpd
+                    zf.extractall(tmpd)
+                base_dir = tmpd
             except Exception as e:
                 st.error(f"Errore unzip: {e}")
                 shutil.rmtree(tmpd, ignore_errors=True)
@@ -272,12 +228,6 @@ if uploads:
             target = root / fp.stem
             shutil.rmtree(target, ignore_errors=True)
             shutil.copytree(base_dir, target)
-            red = target / fp.stem
-            if red.is_dir():
-                for it in red.iterdir():
-                    shutil.move(str(it), target)
-                shutil.rmtree(red, ignore_errors=True)
-
             process_p7m_dir(target)
             shutil.rmtree(tmpd, ignore_errors=True)
 
@@ -291,32 +241,17 @@ if uploads:
         else:
             st.warning(f"Ignoro {name}")
 
-    # pulizia residui
-    for d in root.rglob("*_unz"):
-        shutil.rmtree(d, ignore_errors=True)
-    for p in root.rglob("*.p7m"):
-        p.unlink(missing_ok=True)
-
-    # creazione e preview del ZIP finale
+    # Creazione ZIP finale con struttura originale
     outd = Path(tempfile.mkdtemp(prefix="zip_out_"))
     zipf = outd / output_filename
     with zipfile.ZipFile(zipf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for path in root.iterdir():
-            if path.is_dir():
-                for file in path.rglob('*'):
-                    if file.is_file() and '_unz' not in file.parts and file.suffix.lower() != '.p7m':
-                        zf.write(file, file.relative_to(root))
-            else:
-                if path.suffix.lower() != '.p7m':
-                    zf.write(path, path.name)
+        for path in root.rglob('*'):
+            if path.is_file():
+                zf.write(path, path.relative_to(root))
 
     st.subheader("Anteprima struttura ZIP risultante")
     with zipfile.ZipFile(zipf) as zf:
-        paths = [
-            i.filename
-            for i in zf.infolist()
-            if '_unz' not in i.filename and not i.filename.lower().endswith('.p7m')
-        ]
+        paths = [i.filename for i in zf.infolist()]
     if paths:
         rows = [p.split("/") for p in paths]
         max_levels = max(len(r) for r in rows)
@@ -325,6 +260,12 @@ if uploads:
         for c in cols:
             df[c] = df[c].mask(df[c] == df[c].shift(), "")
         st.table(df)
+
+    # Alert firme non valide
+    if invalid_signatures:
+        st.warning("⚠️ Firme non verificate:")
+        for item in invalid_signatures:
+            st.write(f"• {item}")
 
     with open(zipf, 'rb') as f:
         st.download_button(
