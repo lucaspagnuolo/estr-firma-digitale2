@@ -53,20 +53,24 @@ with col2:
     logo = Image.open("img/Consip_Logo.png")
     st.image(logo, width=300)
 
-# Lista per firme non valide
+# Liste globali per alert
 invalid_signatures = []
+duplication_alerts = []  # per segnalare A vs A_unz non identici
 
+# --- Verifica ed estrazione .p7m ------------------------------------------
 def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, str, bool]:
-    base       = p7m_path.stem
+    base        = p7m_path.stem
     payload_out = out_dir / base
     cert_pem    = out_dir / f"{base}_cert.pem"
     chain_pem   = out_dir / f"{base}_chain.pem"
 
+    # Estrai certificato firmatario
     subprocess.run([
         "openssl", "pkcs7", "-inform", "DER", "-in", str(p7m_path),
         "-print_certs", "-out", str(cert_pem)
     ], capture_output=True)
 
+    # Primo verify
     cmd1 = ["openssl", "verify", "-CAfile", str(TRUST_PEM)]
     if platform.system() in ("Linux", "Darwin"):
         cmd1 += ["-CApath", "/etc/ssl/certs"]
@@ -76,15 +80,17 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
     chain_ok = (p1.returncode == 0) or ("self signed certificate in certificate chain" in stderr1)
 
     # Accetta InfoCamere anche se non nel TSL
-    if "infocamere" in stderr1 or "infocamere" in p1.stdout.lower():
+    ic_hit = ("infocamere" in stderr1) or ("infocamere" in p1.stdout.lower())
+    if ic_hit:
         chain_ok = True
 
+    # Fallback AIA
     if not chain_ok:
-        # fallback AIA
         subprocess.run([
             "openssl", "pkcs7", "-inform", "DER", "-in", str(p7m_path),
             "-print_certs", "-out", str(chain_pem)
         ], capture_output=True)
+
         aia = subprocess.run([
             "openssl", "x509", "-in", str(chain_pem),
             "-noout", "-text"
@@ -113,40 +119,39 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
         if not chain_ok and "unable to get local issuer certificate" in stderr2:
             chain_ok = True
 
-    # Estrazione payload anche se non valido
+    # Estrazione payload (anche se non valido)
     resc = subprocess.run([
         "openssl", "cms", "-verify", "-in", str(p7m_path),
         "-inform", "DER", "-noverify", "-out", str(payload_out)
     ], capture_output=True)
     if resc.returncode != 0:
+        # non estratto
+        cert_pem.unlink(missing_ok=True)
+        chain_pem.unlink(missing_ok=True)
         return None, "", False
 
+    # Lettura firmatario + date
     res2 = subprocess.run([
         "openssl", "x509", "-in", str(cert_pem),
         "-noout", "-subject", "-dates"
     ], capture_output=True, text=True)
     cert_pem.unlink(missing_ok=True)
     chain_pem.unlink(missing_ok=True)
-    if res2.returncode != 0:
-        return payload_out, "Sconosciuto", False
+    signer = "Sconosciuto"
+    if res2.returncode == 0:
+        lines = res2.stdout.splitlines()
+        subj  = "\n".join(lines)
+        m     = re.search(r"(?:CN|SN|UID|emailAddress|SERIALNUMBER)\s*=\s*([^,\/]+)", subj)
+        signer = m.group(1).strip() if m else "Sconosciuto"
 
-    lines  = res2.stdout.splitlines()
-    subj   = "\n".join(lines)
-    m = re.search(r"(?:CN|SN|UID|emailAddress|SERIALNUMBER)\s*=\s*([^,\/]+)", subj)
-    signer = m.group(1).strip() if m else "Sconosciuto"
-
-    fmt = "%b %d %H:%M:%S %Y %Z"
-    nb  = next(l for l in lines if "notBefore" in l).split("=",1)[1].strip()
-    na  = next(l for l in lines if "notAfter"  in l).split("=",1)[1].strip()
-    valid = datetime.strptime(nb, fmt) <= datetime.utcnow() <= datetime.strptime(na, fmt)
-
+    # Flag NONVALIDO se catena non accettata
     if not chain_ok:
         invalid_signatures.append(f"{payload_out.name} | {signer}")
-        # Aggiungi flag al nome
         flagged = payload_out.with_name(payload_out.stem + "_NONVALIDO" + payload_out.suffix)
         payload_out.rename(flagged)
         payload_out = flagged
 
+    # Se payload è ZIP, rinomina correttamente
     try:
         with open(payload_out, "rb") as f:
             if f.read(4) == b"PK\x03\x04":
@@ -158,25 +163,106 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
 
     return payload_out, signer, chain_ok
 
-# --- Funzioni per ZIP ------------------------------------------------------
+# --- Utilità: confronto e flatten duplicati A / A_unz ----------------------
+def _list_relative_paths(base: Path):
+    files = set()
+    dirs  = set()
+    for p in base.rglob('*'):
+        rel = p.relative_to(base)
+        if p.is_file():
+            files.add(rel.as_posix())
+        elif p.is_dir():
+            dirs.add(rel.as_posix())
+    return files, dirs
+
+def _merge_move(src: Path, dst: Path):
+    """Sposta (merge) i contenuti di src dentro dst; se collisione su dir, unisce; se file esiste, lascia quello già presente."""
+    for item in src.iterdir():
+        target = dst / item.name
+        if item.is_dir():
+            if not target.exists():
+                shutil.move(str(item), str(target))
+            else:
+                # merge ricorsivo
+                _merge_move(item, target)
+                # elimina sorgente se vuota
+                try:
+                    item.rmdir()
+                except Exception:
+                    pass
+        else:
+            if not target.exists():
+                shutil.move(str(item), str(target))
+            else:
+                # file già presente, assume duplicato identico e lascia quello in dst
+                pass
+
+def flatten_top_level_duplicates(target: Path):
+    """
+    Dentro 'target' cerca coppia di cartelle duplicate:
+    - 'target.name' e 'target.name_unz'
+    Se hanno stesso numero di file e cartelle e stessa lista di percorsi relativi,
+    sposta i contenuti direttamente in 'target' e rimuove entrambe le cartelle wrapper.
+    Se non identiche, registra un alert e non modifica.
+    Inoltre gestisce il caso in cui esista solo una cartella wrapper (A o A_unz) con contenuti.
+    """
+    name = target.name
+    cand_main = target / name
+    cand_unz  = target / f"{name}_unz"
+
+    # Caso: entrambe presenti
+    if cand_main.exists() and cand_unz.exists() and cand_main.is_dir() and cand_unz.is_dir():
+        files1, dirs1 = _list_relative_paths(cand_main)
+        files2, dirs2 = _list_relative_paths(cand_unz)
+        same = (files1 == files2) and (dirs1 == dirs2)
+
+        if same:
+            # Flatten usando la cartella 'name' come fonte principale
+            _merge_move(cand_main, target)
+            # Elimina entrambe le wrapper (ormai vuote o ridotte)
+            shutil.rmtree(cand_main, ignore_errors=True)
+            shutil.rmtree(cand_unz, ignore_errors=True)
+        else:
+            duplication_alerts.append(
+                f"Duplicazione non identica in «{target.name}»: "
+                f"{cand_main.name} vs {cand_unz.name} (file={len(files1)}/{len(files2)}, dir={len(dirs1)}/{len(dirs2)})"
+            )
+        return
+
+    # Caso: presente solo una wrapper identica al nome ZIP
+    if cand_main.exists() and cand_main.is_dir():
+        # Flatten conservativo: sposta contenuti di A/ dentro A/
+        _merge_move(cand_main, target)
+        shutil.rmtree(cand_main, ignore_errors=True)
+        return
+
+    # Caso: presente solo A_unz
+    if cand_unz.exists() and cand_unz.is_dir():
+        _merge_move(cand_unz, target)
+        shutil.rmtree(cand_unz, ignore_errors=True)
+        return
+
+# --- ZIP annidati e processing .p7m ---------------------------------------
 def recursive_unpack_and_flatten(d: Path):
     for z in d.rglob("*.zip"):
-        if not z.is_file(): continue
+        if not z.is_file():
+            continue
         dst = z.parent / f"{z.stem}_unz"
         shutil.rmtree(dst, ignore_errors=True)
         dst.mkdir()
         try:
             with zipfile.ZipFile(z) as zf:
                 zf.extractall(dst)
-        except:
+        except Exception:
             z.unlink(missing_ok=True)
             continue
         z.unlink(missing_ok=True)
         children = list(dst.iterdir())
         if len(children) == 1 and children[0].is_dir():
             for c in children[0].iterdir():
-                shutil.move(str(c), dst)
+                shutil.move(str(c), str(dst))
             children[0].rmdir()
+        # Ricorsione su ZIP annidati
         recursive_unpack_and_flatten(dst)
 
 def process_p7m_dir(d: Path, indent=""):
@@ -192,7 +278,8 @@ def process_p7m_dir(d: Path, indent=""):
                 with zipfile.ZipFile(payload) as zf:
                     zf.extractall(tmp)
                 payload.unlink(missing_ok=True)
-            except:
+            except Exception:
+                st.error(f"Errore estrazione ZIP interno di {payload.name}")
                 continue
             recursive_unpack_and_flatten(tmp)
             nested = tmp / payload.stem
@@ -206,6 +293,7 @@ output_filename = output_name if output_name.lower().endswith(".zip") else outpu
 uploads = st.file_uploader("Carica .p7m o ZIP", accept_multiple_files=True)
 if uploads:
     root = Path(tempfile.mkdtemp(prefix="combined_"))
+
     for up in uploads:
         name = up.name
         ext = Path(name).suffix.lower()
@@ -224,11 +312,20 @@ if uploads:
                 shutil.rmtree(tmpd, ignore_errors=True)
                 continue
 
+            # Unpack ZIP annidati prima della copia
             recursive_unpack_and_flatten(base_dir)
+
+            # Copia nella radice con nome della ZIP (A, B, C ...)
             target = root / fp.stem
             shutil.rmtree(target, ignore_errors=True)
             shutil.copytree(base_dir, target)
+
+            # Processa .p7m già copiati
             process_p7m_dir(target)
+
+            # ✨ NUOVO: rimuovi duplicazione A / A_unz mantenendo i contenuti
+            flatten_top_level_duplicates(target)
+
             shutil.rmtree(tmpd, ignore_errors=True)
 
         elif ext == ".p7m":
@@ -240,8 +337,9 @@ if uploads:
 
         else:
             st.warning(f"Ignoro {name}")
+            shutil.rmtree(tmpd, ignore_errors=True)
 
-    # Creazione ZIP finale con struttura originale
+    # Creazione ZIP finale mantenendo la struttura risultante
     outd = Path(tempfile.mkdtemp(prefix="zip_out_"))
     zipf = outd / output_filename
     with zipfile.ZipFile(zipf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -254,12 +352,13 @@ if uploads:
         paths = [i.filename for i in zf.infolist()]
     if paths:
         rows = [p.split("/") for p in paths]
-        max_levels = max(len(r) for r in rows)
+        max_levels = max(len(r) for r in rows) if rows else 0
         cols = [f"Liv {i+1}" for i in range(max_levels)]
-        df = pd.DataFrame([r + [""]*(max_levels-len(r)) for r in rows], columns=cols)
-        for c in cols:
-            df[c] = df[c].mask(df[c] == df[c].shift(), "")
-        st.table(df)
+        df = pd.DataFrame([r + [""]*(max_levels-len(r)) for r in rows], columns=cols) if max_levels else pd.DataFrame()
+        if not df.empty:
+            for c in cols:
+                df[c] = df[c].mask(df[c] == df[c].shift(), "")
+            st.table(df)
 
     # Alert firme non valide
     if invalid_signatures:
@@ -267,6 +366,13 @@ if uploads:
         for item in invalid_signatures:
             st.write(f"• {item}")
 
+    # Alert duplicazioni non identiche
+    if duplication_alerts:
+        st.warning("⚠️ Rilevate duplicazioni non identiche tra cartelle 'A' e 'A_unz':")
+        for msg in duplication_alerts:
+            st.write(f"• {msg}")
+
+    # Download ZIP finale
     with open(zipf, 'rb') as f:
         st.download_button(
             "Scarica estratti",
