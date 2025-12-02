@@ -13,6 +13,7 @@ from PIL import Image
 import xml.etree.ElementTree as ET
 import platform
 import requests
+import traceback
 
 # --- Costanti per TSL -----------------------------------------------------
 TSL_FILE  = Path("img/TSL-IT.xml")
@@ -55,7 +56,6 @@ with col2:
 
 # Liste globali per alert
 invalid_signatures = []
-duplication_alerts = []
 
 # --- Verifica ed estrazione .p7m ------------------------------------------
 def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, str, bool]:
@@ -81,40 +81,6 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
     if ic_hit:
         chain_ok = True
 
-    if not chain_ok:
-        subprocess.run([
-            "openssl", "pkcs7", "-inform", "DER", "-in", str(p7m_path),
-            "-print_certs", "-out", str(chain_pem)
-        ], capture_output=True)
-
-        aia = subprocess.run([
-            "openssl", "x509", "-in", str(chain_pem),
-            "-noout", "-text"
-        ], capture_output=True, text=True)
-        url = next((l.split("URI:")[1].strip() for l in aia.stdout.splitlines()
-                    if "CA Issuers - URI:" in l), None)
-        if url:
-            try:
-                r = requests.get(url, timeout=5)
-                if r.status_code == 200 and b"BEGIN CERTIFICATE" in r.content:
-                    with open(chain_pem, "ab") as f:
-                        f.write(b"\n" + r.content + b"\n")
-            except Exception:
-                pass
-
-        cmd2 = [
-            "openssl", "verify", "-CAfile", str(TRUST_PEM),
-            "-untrusted", str(chain_pem)
-        ]
-        if platform.system() in ("Linux", "Darwin"):
-            cmd2 += ["-CApath", "/etc/ssl/certs"]
-        cmd2.append(str(cert_pem))
-        p2 = subprocess.run(cmd2, capture_output=True, text=True)
-        stderr2 = p2.stderr.lower()
-        chain_ok = (p2.returncode == 0) or ("self signed certificate in certificate chain" in stderr2)
-        if not chain_ok and "unable to get local issuer certificate" in stderr2:
-            chain_ok = True
-
     resc = subprocess.run([
         "openssl", "cms", "-verify", "-in", str(p7m_path),
         "-inform", "DER", "-noverify", "-out", str(payload_out)
@@ -124,19 +90,7 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
         chain_pem.unlink(missing_ok=True)
         return None, "", False
 
-    res2 = subprocess.run([
-        "openssl", "x509", "-in", str(cert_pem),
-        "-noout", "-subject", "-dates"
-    ], capture_output=True, text=True)
-    cert_pem.unlink(missing_ok=True)
-    chain_pem.unlink(missing_ok=True)
     signer = "Sconosciuto"
-    if res2.returncode == 0:
-        lines = res2.stdout.splitlines()
-        subj  = "\n".join(lines)
-        m     = re.search(r"(?:CN|SN|UID|emailAddress|SERIALNUMBER)\s*=\s*([^,\/]+)", subj)
-        signer = m.group(1).strip() if m else "Sconosciuto"
-
     if not chain_ok:
         invalid_signatures.append(f"{payload_out.name} | {signer}")
         flagged = payload_out.with_name(payload_out.stem + "_NONVALIDO" + payload_out.suffix)
@@ -156,28 +110,24 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
 
 # --- Funzione aggiornata per ZIP annidati ---------------------------------
 def recursive_unpack_and_flatten(d: Path):
-    """
-    Estrae tutti gli ZIP annidati creando una cartella dedicata per ciascuno.
-    Evita conflitti di nomi e gestisce il caso ZIP che contiene solo ZIP.
-    """
     for z in list(d.rglob("*.zip")):
         if not z.is_file():
             continue
 
-        # Cartella dedicata con nome univoco
         timestamp = datetime.now().strftime("%H%M%S")
         extract_folder = z.parent / f"{z.stem}_{timestamp}"
         extract_folder.mkdir(exist_ok=True)
 
         try:
             with zipfile.ZipFile(z) as zf:
+                st.write(f"Estrazione ZIP annidato: {z.name}")
                 zf.extractall(extract_folder)
             z.unlink(missing_ok=True)
         except Exception as e:
-            st.error(f"Errore unzip: {e}")
+            st.error(f"Errore unzip annidato: {e.__class__.__name__}: {e}")
+            st.code(''.join(traceback.format_exc()))
             continue
 
-        # Ricorsione sulla nuova cartella
         recursive_unpack_and_flatten(extract_folder)
 
 # --- Processa .p7m ---------------------------------------------------------
@@ -214,25 +164,29 @@ if uploads:
         name = up.name
         ext = Path(name).suffix.lower()
         tmpd = Path(tempfile.mkdtemp(prefix="proc_"))
-        fp = tmpd / name
+
+        # Normalizza nome file
+        safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', name)
+        fp = tmpd / safe_name
         fp.write_bytes(up.getbuffer())
 
-        # Debug: verifica caricamento
-        st.write(f"File caricato: {name}, path temporaneo: {fp}, size: {fp.stat().st_size}")
+        # Debug caricamento
+        st.write(f"File caricato: {safe_name}, path temporaneo: {fp}, size: {fp.stat().st_size}")
 
         if ext == ".zip":
-            st.write(f"🔄 ZIP: {name}")
+            st.write(f"🔄 ZIP: {safe_name}")
             try:
                 with zipfile.ZipFile(fp) as zf:
+                    st.write("Contenuto ZIP:", zf.namelist())
                     zf.extractall(tmpd)
             except Exception as e:
-                st.error(f"Errore unzip: {e}")
+                st.error(f"Errore unzip: {e.__class__.__name__}: {e}")
+                st.code(''.join(traceback.format_exc()))
                 shutil.rmtree(tmpd, ignore_errors=True)
                 continue
 
             recursive_unpack_and_flatten(tmpd)
 
-            # Cartella univoca per copia nel root
             unique_target = root / f"{fp.stem}_{datetime.now().strftime('%H%M%S')}"
             shutil.copytree(tmpd, unique_target)
 
@@ -241,14 +195,14 @@ if uploads:
             shutil.rmtree(tmpd, ignore_errors=True)
 
         elif ext == ".p7m":
-            st.write(f"🔄 .p7m: {name}")
+            st.write(f"🔄 .p7m: {safe_name}")
             payload, signer, valid = extract_signed_content(fp, root)
             if payload:
                 st.write(f"– {payload.name} | {signer} | {'✅' if valid else '⚠️'}")
             shutil.rmtree(tmpd, ignore_errors=True)
 
         else:
-            st.warning(f"Ignoro {name}")
+            st.warning(f"Ignoro {safe_name}")
             shutil.rmtree(tmpd, ignore_errors=True)
 
     outd = Path(tempfile.mkdtemp(prefix="zip_out_"))
@@ -275,11 +229,6 @@ if uploads:
         st.warning("⚠️ Firme non verificate:")
         for item in invalid_signatures:
             st.write(f"• {item}")
-
-    if duplication_alerts:
-        st.warning("⚠️ Rilevate duplicazioni non identiche tra cartelle 'A' e 'A_unz':")
-        for msg in duplication_alerts:
-            st.write(f"• {msg}")
 
     with open(zipf, 'rb') as f:
         st.download_button(
