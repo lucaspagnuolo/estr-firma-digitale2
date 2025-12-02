@@ -164,7 +164,9 @@ def recursive_unpack_and_flatten(d: Path):
         if not z.is_file():
             continue
 
-        extract_folder = z.parent / z.stem
+        # Cartella dedicata con nome univoco
+        timestamp = datetime.now().strftime("%H%M%S")
+        extract_folder = z.parent / f"{z.stem}_{timestamp}"
         extract_folder.mkdir(exist_ok=True)
 
         try:
@@ -177,38 +179,6 @@ def recursive_unpack_and_flatten(d: Path):
 
         # Ricorsione sulla nuova cartella
         recursive_unpack_and_flatten(extract_folder)
-
-# --- Flatten duplicati -----------------------------------------------------
-def flatten_top_level_duplicates(target: Path):
-    name = target.name
-    cand_main = target / name
-    cand_unz  = target / f"{name}_unz"
-
-    if cand_main.exists() and cand_unz.exists() and cand_main.is_dir() and cand_unz.is_dir():
-        files1 = {p.relative_to(cand_main).as_posix() for p in cand_main.rglob('*') if p.is_file()}
-        files2 = {p.relative_to(cand_unz).as_posix() for p in cand_unz.rglob('*') if p.is_file()}
-        same = files1 == files2
-
-        if same:
-            for item in cand_main.iterdir():
-                shutil.move(str(item), str(target))
-            shutil.rmtree(cand_main, ignore_errors=True)
-            shutil.rmtree(cand_unz, ignore_errors=True)
-        else:
-            duplication_alerts.append(f"Duplicazione non identica in «{target.name}»: {cand_main.name} vs {cand_unz.name}")
-        return
-
-    if cand_main.exists() and cand_main.is_dir():
-        for item in cand_main.iterdir():
-            shutil.move(str(item), str(target))
-        shutil.rmtree(cand_main, ignore_errors=True)
-        return
-
-    if cand_unz.exists() and cand_unz.is_dir():
-        for item in cand_unz.iterdir():
-            shutil.move(str(item), str(target))
-        shutil.rmtree(cand_unz, ignore_errors=True)
-        return
 
 # --- Processa .p7m ---------------------------------------------------------
 def process_p7m_dir(d: Path, indent=""):
@@ -262,12 +232,11 @@ if uploads:
 
             recursive_unpack_and_flatten(tmpd)
 
-            target = root / fp.stem
-            shutil.rmtree(target, ignore_errors=True)
-            shutil.copytree(tmpd, target)
+            # Cartella univoca per copia nel root
+            unique_target = root / f"{fp.stem}_{datetime.now().strftime('%H%M%S')}"
+            shutil.copytree(tmpd, unique_target)
 
-            process_p7m_dir(target)
-            flatten_top_level_duplicates(target)
+            process_p7m_dir(unique_target)
 
             shutil.rmtree(tmpd, ignore_errors=True)
 
