@@ -156,41 +156,27 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
 
 # --- Funzione aggiornata per ZIP annidati ---------------------------------
 def recursive_unpack_and_flatten(d: Path):
-    zips = [z for z in d.rglob("*.zip") if z.is_file()]
-    if not zips:
-        return
-
-    for z in zips:
-        dst = z.parent / f"{z.stem}_unz"
-        shutil.rmtree(dst, ignore_errors=True)
-        dst.mkdir()
-        try:
-            with zipfile.ZipFile(z) as zf:
-                zf.extractall(dst)
-        except Exception as e:
-            st.error(f"Errore unzip: {e}")
-            z.unlink(missing_ok=True)
-            shutil.rmtree(dst, ignore_errors=True)
+    """
+    Estrae tutti gli ZIP annidati creando una cartella dedicata per ciascuno.
+    Evita conflitti di nomi e gestisce il caso ZIP che contiene solo ZIP.
+    """
+    for z in list(d.rglob("*.zip")):
+        if not z.is_file():
             continue
 
-        z.unlink(missing_ok=True)
+        extract_folder = z.parent / z.stem
+        extract_folder.mkdir(exist_ok=True)
 
-        for item in list(dst.iterdir()):
-            target = z.parent / item.name
-            if target.exists():
-                target = z.parent / f"{item.name}_dup"
-            try:
-                shutil.move(str(item), str(target))
-            except Exception:
-                if item.is_dir():
-                    shutil.copytree(item, target, dirs_exist_ok=True)
-                    shutil.rmtree(item, ignore_errors=True)
-                else:
-                    shutil.copy2(item, target)
-                    item.unlink(missing_ok=True)
+        try:
+            with zipfile.ZipFile(z) as zf:
+                zf.extractall(extract_folder)
+            z.unlink(missing_ok=True)
+        except Exception as e:
+            st.error(f"Errore unzip: {e}")
+            continue
 
-        shutil.rmtree(dst, ignore_errors=True)
-        recursive_unpack_and_flatten(z.parent)
+        # Ricorsione sulla nuova cartella
+        recursive_unpack_and_flatten(extract_folder)
 
 # --- Flatten duplicati -----------------------------------------------------
 def flatten_top_level_duplicates(target: Path):
@@ -261,22 +247,24 @@ if uploads:
         fp = tmpd / name
         fp.write_bytes(up.getbuffer())
 
+        # Debug: verifica caricamento
+        st.write(f"File caricato: {name}, path temporaneo: {fp}, size: {fp.stat().st_size}")
+
         if ext == ".zip":
             st.write(f"🔄 ZIP: {name}")
             try:
                 with zipfile.ZipFile(fp) as zf:
                     zf.extractall(tmpd)
-                base_dir = tmpd
             except Exception as e:
                 st.error(f"Errore unzip: {e}")
                 shutil.rmtree(tmpd, ignore_errors=True)
                 continue
 
-            recursive_unpack_and_flatten(base_dir)
+            recursive_unpack_and_flatten(tmpd)
 
             target = root / fp.stem
             shutil.rmtree(target, ignore_errors=True)
-            shutil.copytree(base_dir, target)
+            shutil.copytree(tmpd, target)
 
             process_p7m_dir(target)
             flatten_top_level_duplicates(target)
