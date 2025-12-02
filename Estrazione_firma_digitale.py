@@ -48,7 +48,7 @@ except Exception as e:
 col1, col2 = st.columns([7,3])
 with col1:
     st.title("ImperialSign 🔒📜")
-    st.caption("Estrai ZIP annidati, verifica firme .p7m, e deduplica/flatten dei contenuti. 🛡️✅")
+    st.caption("Estrai ZIP annidati, verifica firme .p7m, deduplica e conserva i nomi originali. 🛡️✅")
 with col2:
     try:
         logo = Image.open("img/Consip_Logo.png")
@@ -56,9 +56,17 @@ with col2:
     except Exception:
         pass
 
+# --- Preferenze utente -----------------------------------------------------
+RENAME_NONVALID = st.checkbox("Aggiungi suffisso _NONVALIDO ai file con firma non verificata (.p7m)", value=False)
+CONFLICT_STRATEGY = st.selectbox(
+    "Gestione file con stesso nome ma contenuti diversi",
+    ["Rinomina con suffisso _conflict_<timestamp>", "Sposta in sottocartella _conflicts"],
+    index=0
+)
+
 # Liste globali per alert
 invalid_signatures = []
-duplication_alerts = []  # opzionale, puoi non usarla in questa versione
+conflict_logs = []
 
 # --- Utilità di file -------------------------------------------------------
 def file_hash(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -86,20 +94,26 @@ def unique_collision_name(target: Path, suffix_base: str = "_conflict") -> Path:
     else:
         return target.with_name(f"{target.name}{suffix_base}_{ts}")
 
+def ensure_conflicts_dir(dst: Path) -> Path:
+    cdir = dst / "_conflicts"
+    cdir.mkdir(exist_ok=True)
+    return cdir
+
 def _merge_move_with_dedup(src: Path, dst: Path):
     """
     Unisce ricorsivamente i contenuti di 'src' dentro 'dst'.
     - Se collisione su directory: merge.
     - Se collisione su file:
         * se contenuto identico: scarta il duplicato (elimina 'src')
-        * se diverso: rinomina il nuovo con suffisso _conflict_<timestamp>
+        * se diverso:
+            - se strategia = rinomina: rinomina nuovo con suffisso _conflict_<timestamp>
+            - se strategia = cartella: sposta il nuovo in dst/_conflicts mantenendo nome originale
     Alla fine rimuove 'src'.
     """
     dst.mkdir(parents=True, exist_ok=True)
     for item in src.iterdir():
         target = dst / item.name
         if item.is_dir():
-            # Merge directory
             target.mkdir(exist_ok=True)
             _merge_move_with_dedup(item, target)
             try:
@@ -109,22 +123,36 @@ def _merge_move_with_dedup(src: Path, dst: Path):
         else:
             if target.exists():
                 if target.is_file():
-                    # Conflitto di file
                     if files_equal(item, target):
-                        # Identico: elimina duplicato
+                        # Identico: elimina duplicato silenziosamente
                         item.unlink(missing_ok=True)
                     else:
-                        # Diverso: rinomina il nuovo e sposta
-                        new_target = unique_collision_name(target, "_conflict")
-                        shutil.move(str(item), str(new_target))
+                        # Diverso: applica strategia
+                        if CONFLICT_STRATEGY.startswith("Rinomina"):
+                            new_target = unique_collision_name(target, "_conflict")
+                            conflict_logs.append(f"Conflitto: {target} vs nuovo -> rinominato {new_target.name}")
+                            shutil.move(str(item), str(new_target))
+                        else:
+                            cdir = ensure_conflicts_dir(dst)
+                            new_target = cdir / item.name
+                            # Se esiste già in _conflicts, crea variante univoca
+                            if new_target.exists():
+                                new_target = unique_collision_name(new_target, "_conflict")
+                            conflict_logs.append(f"Conflitto: {target} vs nuovo -> spostato in {new_target}")
+                            shutil.move(str(item), str(new_target))
                 else:
-                    # 'target' è directory: rinomina file sorgente
-                    new_target = unique_collision_name(dst / item.name, "_conflict")
-                    shutil.move(str(item), str(new_target))
+                    # 'target' è directory: rinomina o sposta altrove il file sorgente
+                    if CONFLICT_STRATEGY.startswith("Rinomina"):
+                        new_target = unique_collision_name(dst / item.name, "_conflict")
+                        shutil.move(str(item), str(new_target))
+                    else:
+                        cdir = ensure_conflicts_dir(dst)
+                        new_target = cdir / item.name
+                        if new_target.exists():
+                            new_target = unique_collision_name(new_target, "_conflict")
+                        shutil.move(str(item), str(new_target))
             else:
-                # Nessun conflitto: sposta normalmente
                 shutil.move(str(item), str(target))
-    # Prova a rimuovere la sorgente (ora dovrebbe essere vuota)
     try:
         src.rmdir()
     except Exception:
@@ -146,7 +174,6 @@ def collapse_single_wrappers(root: Path):
                 dirs  = [c for c in children if c.is_dir()]
                 if len(dirs) == 1 and len(files) == 0:
                     inner = dirs[0]
-                    # Sposta contenuti dell'unica dir verso 'd'
                     for c in inner.iterdir():
                         shutil.move(str(c), str(d / c.name))
                     try:
@@ -156,7 +183,7 @@ def collapse_single_wrappers(root: Path):
                         pass
 
 # --- Verifica ed estrazione .p7m ------------------------------------------
-def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, str, bool]:
+def extract_signed_content(p7m_path: Path, out_dir: Path, rename_nonvalid: bool) -> tuple[Path | None, str, bool]:
     base        = p7m_path.stem
     payload_out = out_dir / base
     cert_pem    = out_dir / f"{base}_cert.pem"
@@ -196,31 +223,43 @@ def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, 
     try:
         with open(payload_out, "rb") as f:
             if f.read(4) == b"PK\x03\x04":
-                newz = payload_out.with_suffix(".zip")
-                payload_out.rename(newz)
-                payload_out = newz
+                payload_out = payload_out.with_suffix(".zip")
+                # Nota: qui NON aggiungiamo suffissi al nome base
     except Exception:
         pass
 
-    # Lettura firmatario (best-effort)
+    # Best-effort firmatario (non influisce sul nome)
     signer = "Sconosciuto"
     res2 = subprocess.run([
         "openssl", "x509", "-in", str(cert_pem),
         "-noout", "-subject", "-dates"
     ], capture_output=True, text=True)
-    cert_pem.unlink(missing_ok=True)
-    chain_pem.unlink(missing_ok=True)
     if res2.returncode == 0:
         subj  = res2.stdout
         m     = re.search(r"(?:CN|SN|UID|emailAddress|SERIALNUMBER)\s*=\s*([^,\/]+)", subj)
         signer = m.group(1).strip() if m else "Sconosciuto"
 
-    # Flag NONVALIDO se catena non accettata
+    # Pulizia temporanei cert
+    cert_pem.unlink(missing_ok=True)
+    chain_pem.unlink(missing_ok=True)
+
+    # Flag: mantieni nome originale, registra solo alert (oppure rinomina se utente lo chiede)
     if not chain_ok:
         invalid_signatures.append(f"{payload_out.name} | {signer}")
-        flagged = payload_out.with_name(payload_out.stem + "_NONVALIDO" + payload_out.suffix)
-        payload_out.rename(flagged)
-        payload_out = flagged
+        if rename_nonvalid:
+            flagged = payload_out.with_name(payload_out.stem + "_NONVALIDO" + payload_out.suffix)
+            # Se già esiste, crea variante
+            if flagged.exists():
+                flagged = unique_collision_name(flagged, "_nonvalido")
+            try:
+                # Se il payload_out è stato creato dal cms -verify come file senza estensione
+                # e poi lo abbiamo trasformato in .zip solo "virtualmente", assicuriamoci di rinominare sul disco
+                if payload_out.exists():
+                    payload_out.rename(flagged)
+                payload_out = flagged
+            except Exception:
+                # Se fallisce la rename, mantieni nome originale
+                pass
 
     return payload_out, signer, chain_ok
 
@@ -243,7 +282,6 @@ def recursive_extract_flat_into(target_dir: Path):
             try:
                 with zipfile.ZipFile(z) as zf:
                     st.write(f"Estrazione ZIP: {z}")
-                    # Debug: mostra contenuto zip
                     try:
                         st.write({"contenuto": zf.namelist()[:10], "totale": len(zf.namelist())})
                     except Exception:
@@ -255,36 +293,29 @@ def recursive_extract_flat_into(target_dir: Path):
                 shutil.rmtree(tmp_extract, ignore_errors=True)
                 continue
 
-            # Merge con dedup nel livello corrente
             _merge_move_with_dedup(tmp_extract, z.parent)
-
-            # Rimuovi lo ZIP sorgente dopo il merge
             z.unlink(missing_ok=True)
 
-    # Appiattisci wrapper
     collapse_single_wrappers(target_dir)
 
 # --- Processa .p7m ---------------------------------------------------------
 def process_p7m_dir(d: Path, indent=""):
     for p7m in d.rglob("*.p7m"):
-        payload, signer, valid = extract_signed_content(p7m, p7m.parent)
+        payload, signer, valid = extract_signed_content(p7m, p7m.parent, RENAME_NONVALID)
         if not payload:
             continue
         p7m.unlink(missing_ok=True)
         st.write(f"{indent}– {payload.name} | {signer} | {'✅' if valid else '⚠️'}")
         if payload.suffix.lower() == ".zip":
-            # Se il payload è ZIP, estrai e appiattisci
             try:
+                tmp_extract = Path(tempfile.mkdtemp(prefix="unz_p7m_"))
                 with zipfile.ZipFile(payload) as zf:
-                    tmp_extract = Path(tempfile.mkdtemp(prefix="unz_p7m_"))
                     zf.extractall(tmp_extract)
-                # Merge nel parent
                 _merge_move_with_dedup(tmp_extract, payload.parent)
                 payload.unlink(missing_ok=True)
             except Exception:
                 st.error(f"Errore estrazione ZIP interno di {payload.name}")
                 continue
-            # Processa eventuali ulteriori ZIP annidati
             recursive_extract_flat_into(payload.parent)
 
 # --- UI principale ---------------------------------------------------------
@@ -296,40 +327,39 @@ if uploads:
     root = Path(tempfile.mkdtemp(prefix="combined_"))
 
     for up in uploads:
-        original_name = up.name
+        original_name = up.name           # <-- nome originale per la cartella
         ext = Path(original_name).suffix.lower()
         tmpd = Path(tempfile.mkdtemp(prefix="proc_"))
-        # Normalizza nome (evita problemi con spazi e caratteri speciali)
+
+        # File temporaneo sicuro (solo per salvataggio iniziale)
         safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', original_name)
         fp = tmpd / safe_name
         fp.write_bytes(up.getbuffer())
 
         # Debug: caricamento
-        try:
-            size = fp.stat().st_size
-        except Exception:
-            size = -1
-        st.write(f"File caricato: {safe_name}, path temporaneo: {fp}, size: {size}")
+        size = fp.stat().st_size if fp.exists() else -1
+        st.write(f"File caricato: {original_name} (temp: {safe_name}), path: {fp}, size: {size}")
 
         if ext == ".zip":
-            st.write(f"🔄 ZIP: {safe_name}")
+            st.write(f"🔄 ZIP: {original_name}")
             try:
+                # Il nome della cartella di destinazione è lo STEM ORIGINALE (con spazi/punti)
+                dest = root / Path(original_name).stem
+                dest.mkdir(parents=True, exist_ok=True)
+
+                # Estrai in temp e poi MERGE+DEDUP nel dest mantenendo nomi originali
+                tmp_extract = Path(tempfile.mkdtemp(prefix="unz_top_"))
                 with zipfile.ZipFile(fp) as zf:
                     st.write({"contenuto": zf.namelist()[:10], "totale": len(zf.namelist())})
-                    # Crea una cartella univoca di destinazione per questo upload
-                    dest = root / f"{Path(safe_name).stem}_{datetime.now().strftime('%H%M%S')}"
-                    dest.mkdir(parents=True, exist_ok=True)
-                    # Estrai in temp e poi MERGE+DEDUP nel dest
-                    tmp_extract = Path(tempfile.mkdtemp(prefix="unz_top_"))
                     zf.extractall(tmp_extract)
-                    _merge_move_with_dedup(tmp_extract, dest)
+                _merge_move_with_dedup(tmp_extract, dest)
             except Exception as e:
                 st.error(f"Errore unzip: {e.__class__.__name__}: {e}")
                 st.code(''.join(traceback.format_exc()))
                 shutil.rmtree(tmpd, ignore_errors=True)
                 continue
 
-            # Ora gestisci ZIP annidati già dentro dest con flatten + dedup
+            # Gestisci ZIP annidati già dentro dest con flatten + dedup
             recursive_extract_flat_into(dest)
 
             # Processa .p7m eventualmente presenti
@@ -338,15 +368,14 @@ if uploads:
             shutil.rmtree(tmpd, ignore_errors=True)
 
         elif ext == ".p7m":
-            st.write(f"🔄 .p7m: {safe_name}")
-            payload, signer, valid = extract_signed_content(fp, root)
+            st.write(f"🔄 .p7m: {original_name}")
+            payload, signer, valid = extract_signed_content(fp, root, RENAME_NONVALID)
             if payload:
                 st.write(f"– {payload.name} | {signer} | {'✅' if valid else '⚠️'}")
                 if payload.suffix.lower() == ".zip":
-                    # Se il payload è ZIP, estrai nel root e dedup
                     try:
+                        tmp_extract = Path(tempfile.mkdtemp(prefix="unz_p7m_top_"))
                         with zipfile.ZipFile(payload) as zf:
-                            tmp_extract = Path(tempfile.mkdtemp(prefix="unz_p7m_top_"))
                             zf.extractall(tmp_extract)
                         _merge_move_with_dedup(tmp_extract, root)
                         payload.unlink(missing_ok=True)
@@ -356,7 +385,7 @@ if uploads:
             shutil.rmtree(tmpd, ignore_errors=True)
 
         else:
-            st.warning(f"Ignoro {safe_name}")
+            st.warning(f"Ignoro {original_name}")
             shutil.rmtree(tmpd, ignore_errors=True)
 
     # --- Creazione ZIP finale mantenendo la struttura risultante -----------
@@ -384,13 +413,19 @@ if uploads:
         st.error(f"Errore anteprima ZIP finale: {e}")
 
     if invalid_signatures:
-        st.warning("⚠️ Firme non verificate:")
+        st.warning("⚠️ Firme non verificate (nomi originali mantenuti):")
         for item in invalid_signatures:
             st.write(f"• {item}")
+
+    if conflict_logs:
+        st.info("ℹ️ Conflitti gestiti:")
+        for msg in conflict_logs:
+            st.write(f"• {msg}")
 
     with open(zipf, 'rb') as f:
         st.download_button(
             "Scarica estratti",
             data=f,
             file_name=output_filename,
-            mime="application/zip")
+            mime="application/zip"
+        )
