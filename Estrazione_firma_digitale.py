@@ -11,17 +11,16 @@ import pandas as pd
 from PIL import Image
 import xml.etree.ElementTree as ET
 import platform
-import requests
 import hashlib
 import traceback
 import os
 
 # --- Costanti per TSL -----------------------------------------------------
-TSL_FILE  = Path("img/TSL-IT.xml")
+TSL_FILE = Path("img/TSL-IT.xml")
 TRUST_PEM = Path("tsl-ca.pem")
 
 def build_trust_store(tsl_path: Path, out_pem: Path):
-    ns = { 'tsl': 'http://uri.etsi.org/02231/v2#', 'ds':  'http://www.w3.org/2000/09/xmldsig#' }
+    ns = {'tsl': 'http://uri.etsi.org/02231/v2#', 'ds': 'http://www.w3.org/2000/09/xmldsig#'}
     tree = ET.parse(tsl_path)
     root = tree.getroot()
     certs = root.findall('.//ds:X509Certificate', ns)
@@ -37,7 +36,6 @@ def build_trust_store(tsl_path: Path, out_pem: Path):
                 f.write(b64[i:i+64].encode('ascii') + b"\n")
             f.write(b"-----END CERTIFICATE-----\n\n")
 
-# Costruzione trust store
 try:
     build_trust_store(TSL_FILE, TRUST_PEM)
 except Exception as e:
@@ -45,7 +43,7 @@ except Exception as e:
     st.stop()
 
 # --- UI Header -------------------------------------------------------------
-col1, col2 = st.columns([7,3])
+col1, col2 = st.columns([7, 3])
 with col1:
     st.title("ImperialSign 🔒📜")
     st.caption("Estrai ZIP annidati, verifica firme .p7m, deduplica e conserva i nomi originali. 🛡️✅")
@@ -64,7 +62,6 @@ CONFLICT_STRATEGY = st.selectbox(
     index=0
 )
 
-# Liste globali per alert
 invalid_signatures = []
 conflict_logs = []
 
@@ -171,46 +168,40 @@ def extract_signed_content(p7m_path: Path, out_dir: Path, rename_nonvalid: bool)
     if resc.returncode != 0:
         return None, "", False
 
-    # [MOD] Approccio misto
+    # Approccio misto: magic number + fallback nome
     try:
         name_lower = p7m_path.name.lower()
 
         if is_zip_file(payload_out):
             if ".docx.p7m" in name_lower:
                 newdocx = payload_out.with_suffix(".docx")
-                if payload_out.exists():
-                    payload_out.rename(newdocx)
+                payload_out.rename(newdocx)
                 payload_out = newdocx
             elif payload_out.suffix.lower() != ".zip":
                 newz = payload_out.with_suffix(".zip")
                 if newz.name.endswith(".zip.zip"):
                     newz = Path(newz.as_posix().replace(".zip.zip", ".zip"))
-                if payload_out.exists():
-                    payload_out.rename(newz)
+                payload_out.rename(newz)
                 payload_out = newz
 
         elif is_pdf_file(payload_out):
             if payload_out.suffix.lower() != ".pdf":
                 newpdf = payload_out.with_suffix(".pdf")
-                if payload_out.exists():
-                    payload_out.rename(newpdf)
+                payload_out.rename(newpdf)
                 payload_out = newpdf
 
         else:
             if ".pdf.p7m" in name_lower:
                 newpdf = payload_out.with_suffix(".pdf")
-                if payload_out.exists():
-                    payload_out.rename(newpdf)
+                payload_out.rename(newpdf)
                 payload_out = newpdf
             elif ".docx.p7m" in name_lower:
                 newdocx = payload_out.with_suffix(".docx")
-                if payload_out.exists():
-                    payload_out.rename(newdocx)
+                payload_out.rename(newdocx)
                 payload_out = newdocx
             elif ".doc.p7m" in name_lower:
                 newdoc = payload_out.with_suffix(".doc")
-                if payload_out.exists():
-                    payload_out.rename(newdoc)
+                payload_out.rename(newdoc)
                 payload_out = newdoc
     except Exception:
         pass
@@ -264,7 +255,7 @@ def process_p7m_dir(d: Path):
         payload, signer, valid = extract_signed_content(p7m, p7m.parent, RENAME_NONVALID)
         if not payload:
             continue
-        p7m.unlink(missing_ok=True)
+        p7m.unlink(missing_ok=True)  # ✅ Elimina sempre il .p7m originale
         st.write(f"– {payload.name} | {signer} | {'✅' if valid else '⚠️'}")
         if is_zip_file(payload):
             tmp_extract = Path(tempfile.mkdtemp(prefix="unz_p7m_"))
@@ -307,6 +298,7 @@ if uploads:
                         zf.extractall(tmp_extract)
                     _merge_move_with_dedup(tmp_extract, root)
                     recursive_extract_flat_into(root)
+            fp.unlink(missing_ok=True)
         shutil.rmtree(tmpd, ignore_errors=True)
 
     outd = Path(tempfile.mkdtemp(prefix="zip_out_"))
