@@ -458,4 +458,4 @@ if uploads:
             "Scarica estratti",
             data=f,
             file_name=output_filename,
-            mime="application/zip"
+            mime="application/zip")
