@@ -69,6 +69,7 @@ invalid_signatures = []
 conflict_logs = []
 
 # --- Utilità di file -------------------------------------------------------
+
 def file_hash(path: Path, chunk_size: int = 1024 * 1024) -> str:
     """SHA256 del file per confronti contenuto-identici."""
     h = hashlib.sha256()
@@ -98,6 +99,21 @@ def ensure_conflicts_dir(dst: Path) -> Path:
     cdir = dst / "_conflicts"
     cdir.mkdir(exist_ok=True)
     return cdir
+
+# [MOD] Rilevazione tipo file (magic number)
+def is_zip_file(p: Path) -> bool:
+    try:
+        with open(p, "rb") as f:
+            return f.read(4) == b"PK\x03\x04"
+    except Exception:
+        return False
+
+def is_pdf_file(p: Path) -> bool:
+    try:
+        with open(p, "rb") as f:
+            return f.read(4) == b"%PDF"
+    except Exception:
+        return False
 
 def _merge_move_with_dedup(src: Path, dst: Path):
     """
@@ -184,7 +200,7 @@ def collapse_single_wrappers(root: Path):
 
 # --- Verifica ed estrazione .p7m ------------------------------------------
 def extract_signed_content(p7m_path: Path, out_dir: Path, rename_nonvalid: bool) -> tuple[Path | None, str, bool]:
-    base        = p7m_path.stem
+    base        = p7m_path.stem   # es: "file.pdf" oppure "file.zip"
     payload_out = out_dir / base
     cert_pem    = out_dir / f"{base}_cert.pem"
     chain_pem   = out_dir / f"{base}_chain.pem"
@@ -219,13 +235,25 @@ def extract_signed_content(p7m_path: Path, out_dir: Path, rename_nonvalid: bool)
         chain_pem.unlink(missing_ok=True)
         return None, "", False
 
-    # Se il payload è ZIP, rinomina .zip
+    # [MOD] Allinea estensione al tipo reale SOLO se manca o è incoerente
     try:
-        with open(payload_out, "rb") as f:
-            if f.read(4) == b"PK\x03\x04":
-                payload_out = payload_out.with_suffix(".zip")
-                # Nota: qui NON aggiungiamo suffissi al nome base
+        if is_zip_file(payload_out):
+            # Se è ZIP ma il nome non termina con .zip, aggiungilo
+            if payload_out.suffix.lower() != ".zip":
+                newz = payload_out.with_suffix(".zip")
+                # Evita doppio .zip.zip
+                if newz.name.endswith(".zip.zip"):
+                    newz = Path(newz.as_posix().replace(".zip.zip", ".zip"))
+                payload_out.rename(newz)
+                payload_out = newz
+        elif is_pdf_file(payload_out):
+            # Se è PDF ma il nome non termina con .pdf, aggiungilo
+            if payload_out.suffix.lower() != ".pdf":
+                newpdf = payload_out.with_suffix(".pdf")
+                payload_out.rename(newpdf)
+                payload_out = newpdf
     except Exception:
+        # Se la rename fallisce, mantieni il nome originale
         pass
 
     # Best-effort firmatario (non influisce sul nome)
@@ -243,22 +271,18 @@ def extract_signed_content(p7m_path: Path, out_dir: Path, rename_nonvalid: bool)
     cert_pem.unlink(missing_ok=True)
     chain_pem.unlink(missing_ok=True)
 
-    # Flag: mantieni nome originale, registra solo alert (oppure rinomina se utente lo chiede)
+    # Flag: mantieni nome originale; se l'utente ha scelto, rinomina con _NONVALIDO
     if not chain_ok:
         invalid_signatures.append(f"{payload_out.name} | {signer}")
         if rename_nonvalid:
             flagged = payload_out.with_name(payload_out.stem + "_NONVALIDO" + payload_out.suffix)
-            # Se già esiste, crea variante
             if flagged.exists():
                 flagged = unique_collision_name(flagged, "_nonvalido")
             try:
-                # Se il payload_out è stato creato dal cms -verify come file senza estensione
-                # e poi lo abbiamo trasformato in .zip solo "virtualmente", assicuriamoci di rinominare sul disco
                 if payload_out.exists():
                     payload_out.rename(flagged)
                 payload_out = flagged
             except Exception:
-                # Se fallisce la rename, mantieni nome originale
                 pass
 
     return payload_out, signer, chain_ok
@@ -278,6 +302,10 @@ def recursive_extract_flat_into(target_dir: Path):
             break
 
         for z in zips:
+            # [MOD] Protezione extra: apri solo se è davvero ZIP
+            if not is_zip_file(z):
+                continue
+
             tmp_extract = Path(tempfile.mkdtemp(prefix="unz_"))
             try:
                 with zipfile.ZipFile(z) as zf:
@@ -306,7 +334,9 @@ def process_p7m_dir(d: Path, indent=""):
             continue
         p7m.unlink(missing_ok=True)
         st.write(f"{indent}– {payload.name} | {signer} | {'✅' if valid else '⚠️'}")
-        if payload.suffix.lower() == ".zip":
+
+        # [MOD] Tenta estrazione ZIP SOLO se è davvero ZIP
+        if is_zip_file(payload):
             try:
                 tmp_extract = Path(tempfile.mkdtemp(prefix="unz_p7m_"))
                 with zipfile.ZipFile(payload) as zf:
@@ -372,7 +402,8 @@ if uploads:
             payload, signer, valid = extract_signed_content(fp, root, RENAME_NONVALID)
             if payload:
                 st.write(f"– {payload.name} | {signer} | {'✅' if valid else '⚠️'}")
-                if payload.suffix.lower() == ".zip":
+                # [MOD] Tenta estrazione ZIP SOLO se è davvero ZIP
+                if is_zip_file(payload):
                     try:
                         tmp_extract = Path(tempfile.mkdtemp(prefix="unz_p7m_top_"))
                         with zipfile.ZipFile(payload) as zf:
@@ -428,4 +459,3 @@ if uploads:
             data=f,
             file_name=output_filename,
             mime="application/zip"
-        )
