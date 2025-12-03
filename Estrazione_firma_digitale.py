@@ -172,37 +172,35 @@ def extract_signed_content(p7m_path: Path, out_dir: Path, rename_nonvalid: bool)
     try:
         name_lower = p7m_path.name.lower()
 
-        if is_zip_file(payload_out):
+        # ✅ Priorità assoluta a .pdf.p7m
+        if ".pdf.p7m" in name_lower:
+            newpdf = payload_out.with_suffix(".pdf")
+            if payload_out.exists():
+                payload_out.rename(newpdf)
+            payload_out = newpdf
+        elif is_zip_file(payload_out):
             if ".docx.p7m" in name_lower:
                 newdocx = payload_out.with_suffix(".docx")
                 payload_out.rename(newdocx)
                 payload_out = newdocx
-            elif payload_out.suffix.lower() != ".zip":
+            else:
                 newz = payload_out.with_suffix(".zip")
                 if newz.name.endswith(".zip.zip"):
                     newz = Path(newz.as_posix().replace(".zip.zip", ".zip"))
                 payload_out.rename(newz)
                 payload_out = newz
-
         elif is_pdf_file(payload_out):
-            if payload_out.suffix.lower() != ".pdf":
-                newpdf = payload_out.with_suffix(".pdf")
-                payload_out.rename(newpdf)
-                payload_out = newpdf
-
-        else:
-            if ".pdf.p7m" in name_lower:
-                newpdf = payload_out.with_suffix(".pdf")
-                payload_out.rename(newpdf)
-                payload_out = newpdf
-            elif ".docx.p7m" in name_lower:
-                newdocx = payload_out.with_suffix(".docx")
-                payload_out.rename(newdocx)
-                payload_out = newdocx
-            elif ".doc.p7m" in name_lower:
-                newdoc = payload_out.with_suffix(".doc")
-                payload_out.rename(newdoc)
-                payload_out = newdoc
+            newpdf = payload_out.with_suffix(".pdf")
+            payload_out.rename(newpdf)
+            payload_out = newpdf
+        elif ".docx.p7m" in name_lower:
+            newdocx = payload_out.with_suffix(".docx")
+            payload_out.rename(newdocx)
+            payload_out = newdocx
+        elif ".doc.p7m" in name_lower:
+            newdoc = payload_out.with_suffix(".doc")
+            payload_out.rename(newdoc)
+            payload_out = newdoc
     except Exception:
         pass
 
@@ -253,10 +251,11 @@ def recursive_extract_flat_into(target_dir: Path):
 def process_p7m_dir(d: Path):
     for p7m in d.rglob("*.p7m"):
         payload, signer, valid = extract_signed_content(p7m, p7m.parent, RENAME_NONVALID)
-        if not payload:
+        if not payload or not payload.exists():
+            st.write(f"⚠️ Non estratto: {p7m.name} (mantengo il file originale)")
             continue
-        p7m.unlink(missing_ok=True)  # ✅ Elimina sempre il .p7m originale
-        st.write(f"– {payload.name} | {signer} | {'✅' if valid else '⚠️'}")
+        p7m.unlink(missing_ok=True)  # ✅ Elimina solo se estratto
+        st.write(f"✅ Estratto: {payload.name} | {signer} | {'Valido' if valid else 'Non valido'}")
         if is_zip_file(payload):
             tmp_extract = Path(tempfile.mkdtemp(prefix="unz_p7m_"))
             with zipfile.ZipFile(payload) as zf:
@@ -290,15 +289,17 @@ if uploads:
             process_p7m_dir(dest)
         elif ext == ".p7m":
             payload, signer, valid = extract_signed_content(fp, root, RENAME_NONVALID)
-            if payload:
-                st.write(f"– {payload.name} | {signer} | {'✅' if valid else '⚠️'}")
+            if payload and payload.exists():
+                st.write(f"✅ Estratto: {payload.name} | {signer} | {'Valido' if valid else 'Non valido'}")
                 if is_zip_file(payload):
                     tmp_extract = Path(tempfile.mkdtemp(prefix="unz_p7m_top_"))
                     with zipfile.ZipFile(payload) as zf:
                         zf.extractall(tmp_extract)
                     _merge_move_with_dedup(tmp_extract, root)
                     recursive_extract_flat_into(root)
-            fp.unlink(missing_ok=True)
+                fp.unlink(missing_ok=True)
+            else:
+                st.write(f"⚠️ Non estratto: {fp.name} (mantengo il file originale)")
         shutil.rmtree(tmpd, ignore_errors=True)
 
     outd = Path(tempfile.mkdtemp(prefix="zip_out_"))
