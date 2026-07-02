@@ -1,5 +1,5 @@
-
 import streamlit as st
+import os
 import zipfile
 import subprocess
 import tempfile
@@ -8,500 +8,265 @@ from pathlib import Path
 from datetime import datetime
 import re
 import pandas as pd
-from PIL import Image
 import xml.etree.ElementTree as ET
-import platform
-import hashlib
-import traceback
-import os
 
 # --- Costanti per TSL -----------------------------------------------------
-TSL_FILE  = Path("img/TSL-IT.xml")
+TSL_FILE = Path("img/TSL-IT.xml")
 TRUST_PEM = Path("tsl-ca.pem")
 
 def build_trust_store(tsl_path: Path, out_pem: Path):
-    ns = { 'tsl': 'http://uri.etsi.org/02231/v2#', 'ds':  'http://www.w3.org/2000/09/xmldsig#' }
+    ns = {
+        'tsl': 'http://uri.etsi.org/02231/v2#',
+        'ds': 'http://www.w3.org/2000/09/xmldsig#'
+    }
+
     tree = ET.parse(tsl_path)
-    root = tree.getroot()
-    certs = root.findall('.//ds:X509Certificate', ns)
+    certs = tree.getroot().findall('.//ds:X509Certificate', ns)
+
     if not certs:
         raise RuntimeError(f"Nessun certificato trovato in {tsl_path}")
+
     with open(out_pem, 'wb') as f:
         for cert in certs:
             b64 = cert.text.strip() if cert.text else ""
             if len(b64) < 200:
                 continue
+
             f.write(b"-----BEGIN CERTIFICATE-----\n")
             for i in range(0, len(b64), 64):
                 f.write(b64[i:i+64].encode('ascii') + b"\n")
             f.write(b"-----END CERTIFICATE-----\n\n")
 
-# Costruzione trust store
 try:
     build_trust_store(TSL_FILE, TRUST_PEM)
 except Exception as e:
     st.error(f"Impossibile costruire il trust store: {e}")
     st.stop()
 
-# --- UI Header -------------------------------------------------------------
-col1, col2 = st.columns([7,3])
-with col1:
-    st.title("ImperialSign 🔒📜")
-    st.caption("Estrai ZIP annidati, verifica firme .p7m, deduplica e conserva i nomi originali. 🛡️✅")
-with col2:
-    try:
-        logo = Image.open("img/Consip_Logo.png")
-        st.image(logo, width=300)
-    except Exception:
-        pass
+# --- HEADER --------------------------------------------------------------
+st.title("ImperialSign 🔒📜")
+st.caption("Estrai con fiducia. Verifica la firma digitale. Archivia con ordine. 🛡️✅")
 
-# --- Preferenze utente -----------------------------------------------------
-RENAME_NONVALID = st.checkbox("Aggiungi suffisso _NONVALIDO ai file con firma non verificata (.p7m)", value=False)
-CONFLICT_STRATEGY = st.selectbox(
-    "Gestione file con stesso nome ma contenuti diversi",
-    ["Rinomina con suffisso _conflict_<timestamp>", "Sposta in sottocartella _conflicts"],
-    index=0
-)
 
-# Liste globali per alert
-invalid_signatures = []
-conflict_logs = []
-
-# --- Utilità di file -------------------------------------------------------
-
-def file_hash(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    """SHA256 del file per confronti contenuto-identici."""
-    import hashlib as _hashlib
-    h = _hashlib.sha256()
-    with open(path, 'rb') as f:
-        for chunk in iter(lambda: f.read(chunk_size), b''):
-            h.update(chunk)
-    return h.hexdigest()
-
-def files_equal(a: Path, b: Path) -> bool:
-    """Confronto rapido: size + (se uguali) hash."""
-    try:
-        if a.stat().st_size != b.stat().st_size:
-            return False
-        return file_hash(a) == file_hash(b)
-    except Exception:
-        return False
-
-def unique_collision_name(target: Path, suffix_base: str = "_conflict") -> Path:
-    """Genera un nome univoco affiancando un suffisso con timestamp."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    if target.suffix:
-        return target.with_name(f"{target.stem}{suffix_base}_{ts}{target.suffix}")
-    else:
-        return target.with_name(f"{target.name}{suffix_base}_{ts}")
-
-def ensure_conflicts_dir(dst: Path) -> Path:
-    cdir = dst / "_conflicts"
-    cdir.mkdir(exist_ok=True)
-    return cdir
-
-# Magic numbers
-def is_zip_file(p: Path) -> bool:
-    try:
-        with open(p, "rb") as f:
-            return f.read(4) == b"PK\x03\x04"
-    except Exception:
-        return False
-
-def is_pdf_file(p: Path) -> bool:
-    try:
-        with open(p, "rb") as f:
-            return f.read(4) == b"%PDF"
-    except Exception:
-        return False
-
-def _merge_move_with_dedup(src: Path, dst: Path):
-    """
-    Unisce ricorsivamente i contenuti di 'src' dentro 'dst'.
-    - Se collisione su directory: merge.
-    - Se collisione su file:
-        * se contenuto identico: scarta il duplicato (elimina 'src')
-        * se diverso:
-            - se strategia = rinomina: rinomina nuovo con suffisso _conflict_<timestamp>
-            - se strategia = cartella: sposta il nuovo in dst/_conflicts mantenendo nome originale
-    Alla fine rimuove 'src'.
-    """
-    dst.mkdir(parents=True, exist_ok=True)
-    for item in src.iterdir():
-        target = dst / item.name
-        if item.is_dir():
-            target.mkdir(exist_ok=True)
-            _merge_move_with_dedup(item, target)
-            try:
-                item.rmdir()
-            except Exception:
-                shutil.rmtree(item, ignore_errors=True)
-        else:
-            if target.exists():
-                if target.is_file():
-                    if files_equal(item, target):
-                        item.unlink(missing_ok=True)
-                    else:
-                        if CONFLICT_STRATEGY.startswith("Rinomina"):
-                            new_target = unique_collision_name(target, "_conflict")
-                            conflict_logs.append(f"Conflitto: {target} vs nuovo -> rinominato {new_target.name}")
-                            shutil.move(str(item), str(new_target))
-                        else:
-                            cdir = ensure_conflicts_dir(dst)
-                            new_target = cdir / item.name
-                            if new_target.exists():
-                                new_target = unique_collision_name(new_target, "_conflict")
-                            conflict_logs.append(f"Conflitto: {target} vs nuovo -> spostato in {new_target}")
-                            shutil.move(str(item), str(new_target))
-                else:
-                    # target è directory: gestisci come conflitto
-                    if CONFLICT_STRATEGY.startswith("Rinomina"):
-                        new_target = unique_collision_name(dst / item.name, "_conflict")
-                        shutil.move(str(item), str(new_target))
-                    else:
-                        cdir = ensure_conflicts_dir(dst)
-                        new_target = cdir / item.name
-                        if new_target.exists():
-                            new_target = unique_collision_name(new_target, "_conflict")
-                        shutil.move(str(item), str(new_target))
-            else:
-                shutil.move(str(item), str(target))
-    try:
-        src.rmdir()
-    except Exception:
-        shutil.rmtree(src, ignore_errors=True)
-
-def collapse_single_wrappers(root: Path):
-    """
-    Appiattisce wrapper inutili (cartella con unica sottocartella e nessun file).
-    """
-    changed = True
-    while changed:
-        changed = False
-        for d in list(root.rglob("*")):
-            if d.is_dir():
-                children = list(d.iterdir())
-                files = [c for c in children if c.is_file()]
-                dirs  = [c for c in children if c.is_dir()]
-                if len(dirs) == 1 and len(files) == 0:
-                    inner = dirs[0]
-                    for c in inner.iterdir():
-                        shutil.move(str(c), str(d / c.name))
-                    try:
-                        inner.rmdir()
-                        changed = True
-                    except Exception:
-                        pass
-
-# --- Verifica ed estrazione .p7m (approccio misto + priorità .pdf.p7m) ---
-def extract_signed_content(p7m_path: Path, out_dir: Path, rename_nonvalid: bool) -> tuple[Path | None, str, bool]:
-    base        = p7m_path.stem
+# --- Estrazione p7m ------------------------------------------------------
+def extract_signed_content(p7m_path: Path, out_dir: Path) -> tuple[Path | None, str, bool]:
+    base = p7m_path.stem
     payload_out = out_dir / base
-    cert_pem    = out_dir / f"{base}_cert.pem"
-    chain_pem   = out_dir / f"{base}_chain.pem"
+    cert_pem = out_dir / f"{base}_cert.pem"
 
-    # Estrai certificato firmatario
     subprocess.run([
         "openssl", "pkcs7", "-inform", "DER", "-in", str(p7m_path),
         "-print_certs", "-out", str(cert_pem)
     ], capture_output=True)
 
-    # Verify catena
-    cmd1 = ["openssl", "verify", "-CAfile", str(TRUST_PEM)]
-    if platform.system() in ("Linux", "Darwin"):
-        cmd1 += ["-CApath", "/etc/ssl/certs"]
-    cmd1.append(str(cert_pem))
-    p1 = subprocess.run(cmd1, capture_output=True, text=True)
-    stderr1 = p1.stderr.lower()
-    chain_ok = (p1.returncode == 0) or ("self signed certificate in certificate chain" in stderr1)
-
-    # Estrazione payload (anche se non valido)
-    resc = subprocess.run([
+    proc = subprocess.run([
         "openssl", "cms", "-verify", "-in", str(p7m_path),
         "-inform", "DER", "-noverify", "-out", str(payload_out)
-    ], capture_output=True)
-    if resc.returncode != 0:
-        cert_pem.unlink(missing_ok=True)
-        chain_pem.unlink(missing_ok=True)
-        return None, "", False
+    ], capture_output=True, text=True)
 
-    # Approccio misto: magic number + fallback sul nome
-    try:
-        name_lower = p7m_path.name.lower()
+    if proc.returncode != 0:
+        err = proc.stderr.lower()
 
-        # ✅ priorità assoluta: .pdf.p7m -> .pdf
-        if ".pdf.p7m" in name_lower:
-            newpdf = payload_out.with_suffix(".pdf")
-            if payload_out.exists():
-                payload_out.rename(newpdf)
-            payload_out = newpdf
+        if "bad signature" in err:
+            st.warning(f"{p7m_path.name}: firma non valida. Estraggo contenuto.")
 
-        elif is_zip_file(payload_out):
-            # DOCX è ZIP: se il nome indica .docx.p7m preferisci .docx
-            if ".docx.p7m" in name_lower and payload_out.suffix.lower() != ".docx":
-                newdocx = payload_out.with_suffix(".docx")
-                if payload_out.exists():
-                    payload_out.rename(newdocx)
-                payload_out = newdocx
-            else:
-                # ZIP normale
-                if payload_out.suffix.lower() != ".zip":
-                    newz = payload_out.with_suffix(".zip")
-                    if newz.name.endswith(".zip.zip"):
-                        newz = Path(newz.as_posix().replace(".zip.zip", ".zip"))
-                    if payload_out.exists():
-                        payload_out.rename(newz)
-                    payload_out = newz
+            fallback = subprocess.run([
+                "openssl", "smime", "-verify", "-inform", "DER",
+                "-in", str(p7m_path), "-noverify", "-out", str(payload_out)
+            ], capture_output=True, text=True)
 
-        elif is_pdf_file(payload_out):
-            if payload_out.suffix.lower() != ".pdf":
-                newpdf = payload_out.with_suffix(".pdf")
-                if payload_out.exists():
-                    payload_out.rename(newpdf)
-                payload_out = newpdf
-
+            if fallback.returncode != 0:
+                st.error(f"Estrazione fallback fallita: {fallback.stderr.strip()}")
+                cert_pem.unlink(missing_ok=True)
+                return None, "", False
         else:
-            # Fallback se il magic non è chiaro
-            if ".docx.p7m" in name_lower and payload_out.suffix.lower() != ".docx":
-                newdocx = payload_out.with_suffix(".docx")
-                if payload_out.exists():
-                    payload_out.rename(newdocx)
-                payload_out = newdocx
-            elif ".doc.p7m" in name_lower and payload_out.suffix.lower() != ".doc":
-                newdoc = payload_out.with_suffix(".doc")
-                if payload_out.exists():
-                    payload_out.rename(newdoc)
-                payload_out = newdoc
-            # altrimenti lascia il nome base (senza estensione aggiuntiva)
+            st.error(f"Errore estrazione '{p7m_path.name}': {proc.stderr.strip()}")
+            cert_pem.unlink(missing_ok=True)
+            return None, "", False
+
+    # Detect PDF
+    try:
+        with open(payload_out, 'rb') as f:
+            if f.read(4) == b'%PDF':
+                new_pdf = payload_out.with_suffix('.pdf')
+                payload_out.rename(new_pdf)
+                payload_out = new_pdf
     except Exception:
         pass
 
-    # Firmatario (best-effort)
-    signer = "Sconosciuto"
-    res2 = subprocess.run([
+    # Cert info
+    cert_info = subprocess.run([
         "openssl", "x509", "-in", str(cert_pem),
-        "-noout", "-subject"
+        "-noout", "-subject", "-dates"
     ], capture_output=True, text=True)
-    if res2.returncode == 0:
-        m = re.search(r"(?:CN|SN|UID|emailAddress|SERIALNUMBER)\s*=\s*([^,\/]+)", res2.stdout)
-        signer = m.group(1).strip() if m else "Sconosciuto"
 
-    # Pulizia cert temporanei
     cert_pem.unlink(missing_ok=True)
-    chain_pem.unlink(missing_ok=True)
 
-    # Gestione NONVALIDO (non rinomina se l'utente non ha scelto)
-    if not chain_ok:
-        invalid_signatures.append(f"{payload_out.name} | {signer}")
-        if RENAME_NONVALID:
-            flagged = payload_out.with_name(payload_out.stem + "_NONVALIDO" + payload_out.suffix)
-            if flagged.exists():
-                flagged = unique_collision_name(flagged, "_nonvalido")
-            try:
-                if payload_out.exists():
-                    payload_out.rename(flagged)
-                payload_out = flagged
-            except Exception:
-                pass
+    if cert_info.returncode != 0:
+        return payload_out, "Sconosciuto", False
 
-    return payload_out, signer, chain_ok
+    lines = cert_info.stdout.splitlines()
+    subj = "\n".join(lines)
 
-# --- Estrazione ZIP annidati con flatten + dedup ---------------------------
-def recursive_extract_flat_into(target_dir: Path):
-    """
-    Estrae TUTTI gli ZIP (anche annidati) dentro 'target_dir' appiattendo la struttura:
-    - Per ogni .zip trovato: estrai in una cartella temporanea, poi MERGE nel target con dedup.
-    - Elimina il .zip dopo l'estrazione.
-    - Ripeti finché non restano ZIP.
-    - Appiattisci wrapper inutili alla fine.
-    """
-    while True:
-        zips = [z for z in target_dir.rglob("*.zip") if z.is_file()]
-        if not zips:
-            break
+    m = re.search(r"CN\s*=\s*([^,\/]+)", subj)
+    signer = m.group(1).strip() if m else "Sconosciuto"
 
-        for z in zips:
-            if not is_zip_file(z):  # protezione extra
-                continue
+    fmt = "%b %d %H:%M:%S %Y %Z"
 
-            tmp_extract = Path(tempfile.mkdtemp(prefix="unz_"))
-            try:
-                with zipfile.ZipFile(z) as zf:
-                    zf.extractall(tmp_extract)
-            except Exception as e:
-                st.error(f"Errore unzip annidato: {e.__class__.__name__}: {e}")
-                st.code(''.join(traceback.format_exc()))
-                shutil.rmtree(tmp_extract, ignore_errors=True)
-                continue
+    try:
+        start = next(l for l in lines if 'notBefore' in l).split('=',1)[1].strip()
+        end = next(l for l in lines if 'notAfter' in l).split('=',1)[1].strip()
 
-            _merge_move_with_dedup(tmp_extract, z.parent)
-            z.unlink(missing_ok=True)
+        valid = datetime.strptime(start, fmt) <= datetime.utcnow() <= datetime.strptime(end, fmt)
+    except Exception:
+        valid = False
 
-    collapse_single_wrappers(target_dir)
+    return payload_out, signer, valid
 
-# --- Processa .p7m UNA PASSATA: elimina .p7m SOLO se estratto -------------
-def process_p7m_dir(d: Path, indent="") -> int:
-    """
-    Processa i .p7m dentro 'd'.
-    Ritorna il numero di payload estratti con successo (per iterazioni successive).
-    """
-    extracted_count = 0
-    for p7m in list(d.rglob("*.p7m")):
-        payload, signer, valid = extract_signed_content(p7m, p7m.parent, RENAME_NONVALID)
-        if not payload or not payload.exists():
-            st.write(f"{indent}⚠️ Non estratto: {p7m.name} (mantengo il file originale)")
+
+# --- ZIP annidati --------------------------------------------------------
+def recursive_unpack_and_flatten(d: Path):
+    for z in d.rglob("*.zip"):
+        if not z.is_file():
             continue
 
-        extracted_count += 1
-        # elimina il .p7m solo se abbiamo creato il payload
+        dst = z.parent / f"{z.stem}_unz"
+        shutil.rmtree(dst, ignore_errors=True)
+        dst.mkdir()
+
+        try:
+            with zipfile.ZipFile(z) as zf:
+                zf.extractall(dst)
+        except Exception:
+            z.unlink(missing_ok=True)
+            continue
+
+        z.unlink(missing_ok=True)
+
+        children = list(dst.iterdir())
+        if len(children) == 1 and children[0].is_dir():
+            for c in children[0].iterdir():
+                shutil.move(str(c), dst)
+            children[0].rmdir()
+
+        recursive_unpack_and_flatten(dst)
+
+
+# --- Process directory ---------------------------------------------------
+def process_p7m_dir(d: Path, indent=""):
+    for p7m in d.rglob("*.p7m"):
+        payload, signer, valid = extract_signed_content(p7m, p7m.parent)
+
+        if not payload:
+            continue
+
         p7m.unlink(missing_ok=True)
 
-        st.write(f"{indent}✅ {payload.name} | {signer} | {'Valido' if valid else 'Non valido'}")
+        st.write(f"{indent}– {payload.name} | {signer} | {'✅' if valid else '⚠️'}")
 
-        # se il payload è ZIP: estrai e appiattisci
-        if is_zip_file(payload):
+        if payload.suffix.lower() == ".zip":
             try:
-                tmp_extract = Path(tempfile.mkdtemp(prefix="unz_p7m_"))
                 with zipfile.ZipFile(payload) as zf:
-                    zf.extractall(tmp_extract)
-                _merge_move_with_dedup(tmp_extract, payload.parent)
-                payload.unlink(missing_ok=True)
+                    zf.extractall(payload.parent)
+                recursive_unpack_and_flatten(payload.parent)
             except Exception:
-                st.error(f"{indent}Errore estrazione ZIP interno di {payload.name}")
-                continue
+                st.error(f"Errore estrazione ZIP interno di {payload.name}")
 
-            # dopo l'estrazione di ZIP annidati, appiattisci
-            recursive_extract_flat_into(payload.parent)
-    return extracted_count
+            process_p7m_dir(payload.parent, indent + "  ")
 
-# --- ITERAZIONE: estrai p7m finché non ne restano da estrarre -------------
-def extract_all_p7m_recursively(base: Path):
-    """
-    Esegue passate successive di estrazione .p7m finché ogni passata
-    non produce nuovi payload.
-    """
-    passes = 0
-    while True:
-        passes += 1
-        st.write(f"🔁 Passata estrazione .p7m #{passes} in {base}")
-        extracted = process_p7m_dir(base, indent="  ")
-        # Appiattisci wrapper ad ogni passata (utile per strutture tipo 'medtronic_economica/medtronic_economica')
-        collapse_single_wrappers(base)
-        if extracted == 0:
-            st.write("✅ Nessun nuovo payload .p7m estratto. Estrrazione completa.")
-            break
 
-# --- UI principale ---------------------------------------------------------
+# --- UI principale -------------------------------------------------------
 output_name = st.text_input("Nome ZIP di output (.zip):", value="all_extracted.zip")
 output_filename = output_name if output_name.lower().endswith(".zip") else output_name + ".zip"
 
 uploads = st.file_uploader("Carica .p7m o ZIP", accept_multiple_files=True)
+
 if uploads:
     root = Path(tempfile.mkdtemp(prefix="combined_"))
 
     for up in uploads:
-        original_name = up.name           # <-- nome originale per la cartella
-        ext = Path(original_name).suffix.lower()
-        tmpd = Path(tempfile.mkdtemp(prefix="proc_"))
+        name = up.name
+        ext = Path(name).suffix.lower()
 
-        # File temporaneo sicuro (solo per salvataggio iniziale)
-        safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', original_name)
-        fp = tmpd / safe_name
+        tmpd = Path(tempfile.mkdtemp(prefix="proc_"))
+        fp = tmpd / name
         fp.write_bytes(up.getbuffer())
 
-        # Debug: caricamento
-        size = fp.stat().st_size if fp.exists() else -1
-        st.write(f"File caricato: {original_name} (temp: {safe_name}), path: {fp}, size: {size}")
-
         if ext == ".zip":
-            st.write(f"🔄 ZIP: {original_name}")
+            st.write(f"🔄 ZIP: {name}")
+
             try:
-                # cartella destinazione = stem originale (mantiene spazi/punti)
-                dest = root / Path(original_name).stem
-                dest.mkdir(parents=True, exist_ok=True)
-
-                # Estrai zip al top e merge+dedup
-                tmp_extract = Path(tempfile.mkdtemp(prefix="unz_top_"))
                 with zipfile.ZipFile(fp) as zf:
-                    st.write({"contenuto": zf.namelist()[:10], "totale": len(zf.namelist())})
-                    zf.extractall(tmp_extract)
-                _merge_move_with_dedup(tmp_extract, dest)
+                    zf.extractall(tmpd)
+
+                recursive_unpack_and_flatten(tmpd)
+
+                target = root / fp.stem
+                shutil.rmtree(target, ignore_errors=True)
+                shutil.copytree(tmpd, target)
+
+                process_p7m_dir(target)
+
             except Exception as e:
-                st.error(f"Errore unzip: {e.__class__.__name__}: {e}")
-                st.code(''.join(traceback.format_exc()))
+                st.error(f"Errore unzip: {e}")
+
+            finally:
                 shutil.rmtree(tmpd, ignore_errors=True)
-                continue
-
-            # ZIP annidati
-            recursive_extract_flat_into(dest)
-            # 🔁 Itera finché non restano .p7m da estrarre
-            extract_all_p7m_recursively(dest)
-
-            shutil.rmtree(tmpd, ignore_errors=True)
 
         elif ext == ".p7m":
-            st.write(f"🔄 .p7m: {original_name}")
-            # Estrai singolo .p7m nel root
-            payload, signer, valid = extract_signed_content(fp, root, RENAME_NONVALID)
-            if payload and payload.exists():
-                st.write(f"✅ {payload.name} | {signer} | {'Valido' if valid else 'Non valido'}")
-                if is_zip_file(payload):
-                    try:
-                        tmp_extract = Path(tempfile.mkdtemp(prefix="unz_p7m_top_"))
-                        with zipfile.ZipFile(payload) as zf:
-                            zf.extractall(tmp_extract)
-                        _merge_move_with_dedup(tmp_extract, root)
-                        payload.unlink(missing_ok=True)
-                    except Exception:
-                        st.error(f"Errore estrazione ZIP da payload {payload.name}")
-                    recursive_extract_flat_into(root)
-                # elimina il p7m originale solo se estratto
-                fp.unlink(missing_ok=True)
-            else:
-                st.write(f"⚠️ Non estratto: {fp.name} (mantengo il file originale)")
+            st.write(f"🔄 .p7m: {name}")
 
-            # 🔁 Itera finché non restano .p7m da estrarre
-            extract_all_p7m_recursively(root)
+            payload, signer, valid = extract_signed_content(fp, root)
+
+            if payload:
+                st.write(f"– {payload.name} | {signer} | {'✅' if valid else '⚠️'}")
 
             shutil.rmtree(tmpd, ignore_errors=True)
 
         else:
-            st.warning(f"Ignoro {original_name}")
-            shutil.rmtree(tmpd, ignore_errors=True)
+            st.warning(f"Ignoro {name}")
 
-    # --- Creazione ZIP finale mantenendo la struttura risultante -----------
+    # Pulizia
+    for d in root.rglob("*_unz"):
+        shutil.rmtree(d, ignore_errors=True)
+
+    for p in root.rglob("*.p7m"):
+        p.unlink(missing_ok=True)
+
+    # --- ZIP FINALE + ANTEPRIMA ------------------------------------------
     outd = Path(tempfile.mkdtemp(prefix="zip_out_"))
     zipf = outd / output_filename
+
     with zipfile.ZipFile(zipf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for path in root.rglob('*'):
-            if path.is_file():
-                zf.write(path, path.relative_to(root))
+        for path in root.iterdir():
+            if path.is_dir():
+                for file in path.rglob('*'):
+                    if file.is_file() and '_unz' not in file.parts and file.suffix.lower() != '.p7m':
+                        zf.write(file, file.relative_to(root))
+            else:
+                if path.suffix.lower() != '.p7m':
+                    zf.write(path, path.name)
 
     st.subheader("Anteprima struttura ZIP risultante")
-    try:
-        with zipfile.ZipFile(zipf) as zf:
-            paths = [i.filename for i in zf.infolist()]
-        if paths:
-            rows = [p.split("/") for p in paths]
-            max_levels = max(len(r) for r in rows) if rows else 0
-            cols = [f"Liv {i+1}" for i in range(max_levels)]
-            df = pd.DataFrame([r + [""]*(max_levels-len(r)) for r in rows], columns=cols) if max_levels else pd.DataFrame()
-            if not df.empty:
-                for c in cols:
-                    df[c] = df[c].mask(df[c] == df[c].shift(), "")
-                st.table(df)
-    except Exception as e:
-        st.error(f"Errore anteprima ZIP finale: {e}")
 
-    if invalid_signatures:
-        st.warning("⚠️ Firme non verificate (nomi originali mantenuti):")
-        for item in invalid_signatures:
-            st.write(f"• {item}")
+    with zipfile.ZipFile(zipf) as zf:
+        paths = [i.filename for i in zf.infolist()
+                 if '_unz' not in i.filename and not i.filename.lower().endswith('.p7m')]
 
-    if conflict_logs:
-        st.info("ℹ️ Conflitti gestiti:")
-        for msg in conflict_logs:
-            st.write(f"• {msg}")
+    if paths:
+        rows = [p.split("/") for p in paths]
+        max_levels = max(len(r) for r in rows)
+        cols = [f"Liv {i+1}" for i in range(max_levels)]
+
+        df = pd.DataFrame(
+            [r + [""]*(max_levels-len(r)) for r in rows],
+            columns=cols
+        )
+
+        for c in cols:
+            df[c] = df[c].mask(df[c] == df[c].shift(), "")
+
+        st.table(df)
 
     with open(zipf, 'rb') as f:
         st.download_button(
