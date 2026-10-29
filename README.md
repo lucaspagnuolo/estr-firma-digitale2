@@ -1,1 +1,0 @@
-# estr-firma-digitale2

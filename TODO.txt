@@ -1,0 +1,7 @@
+gestire logging!  (debug/info/error...)
+gestione errori rete e business logic
+fare tests
+montare servizio server
+fare auth
+gestire certificati (update certificati? umano incolla? update automatico periodico?)
+

@@ -1,4 +1,24 @@
+# Applicazione
 streamlit
+fastapi
+uvicorn[standard]
+
+# Microsoft Entra ID
+msal
+
+# Sessione
+itsdangerous
+
+# Configurazione
+python-dotenv
+
+# Elaborazione
 pyopenssl
 Pillow
-pandas 
+pandas
+
+# Test
+pytest
+pytest-asyncio
+pytest-cov
+httpx
