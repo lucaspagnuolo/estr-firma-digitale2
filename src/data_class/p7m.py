@@ -1,31 +1,49 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 
-@dataclass
-class P7MSignatureLevel:
-    """Descrive un singolo livello di firma P7M."""
+@dataclass(slots=True)
+class ExtractedItem:
+    """
+    Elemento prodotto dalla sfirma ricorsiva.
 
-    level: int
-    source: str
-    payload: str
-    signer: str | None
-    valid: bool
+    Un elemento può rappresentare:
+
+    - un file finale sfirmato;
+    - una directory ottenuta dall'estrazione di uno ZIP.
+
+    `path` è valorizzato soltanto per i file finali.
+    `children` è utilizzato soltanto per le directory.
+
+    Il ricostruttore può riprodurre la gerarchia attraversando
+    ricorsivamente `children` e copiando ogni `path` con il relativo
+    `name`.
+    """
+
+    name: str
+    kind: Literal["file", "directory"]
+    path: Path | None = None
+    children: list["ExtractedItem"] = field(default_factory=list)
+    error: str | None = None
+
+    @property
+    def successful(self) -> bool:
+        """Indica se l'elemento e tutti i suoi figli sono validi."""
+        return (
+            self.error is None
+            and all(child.successful for child in self.children)
+        )
 
 
-@dataclass
+@dataclass(slots=True)
 class P7MUnwrapResult:
     """
-    Risultato dell'estrazione ricorsiva.
+    Risultato della sfirma ricorsiva.
 
-    `payload` può rappresentare:
-
-    - il file finale estratto;
-    - la directory radice ottenuta dall'estrazione di uno ZIP.
-
-    La struttura delle directory prodotte viene preservata e costituisce
-    la rappresentazione ricostruibile del contenuto originario.
+    `root` rappresenta la struttura logica da passare al ricostruttore.
     """
 
-    payload: Path | None = None
-    signatures: list[P7MSignatureLevel] = field(default_factory=list)
+    root: ExtractedItem

@@ -3,19 +3,19 @@ streamlit
 fastapi
 uvicorn[standard]
 
-# Microsoft Entra ID
+# Microsoft Entra ID e sessioni
 msal
-
-# Sessione
 itsdangerous
 
 # Configurazione
 python-dotenv
 
+# Firma digitale, certificati e XML sicuro
+cryptography
+defusedxml
+
 # Elaborazione
 pyopenssl
-Pillow
-pandas
 
 # Test
 pytest
