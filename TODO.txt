@@ -1,5 +1,7 @@
 fare tests
 
-
 montare servizio server
 fare auth
+
+opnessl non instalalbile su pc consip...
+inserire procedure di validazione guidata con trust.pem e TLS.xml
